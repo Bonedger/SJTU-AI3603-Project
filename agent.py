@@ -380,18 +380,226 @@ class BasicAgent(Agent):
             return self._random_action()
 
 class NewAgent(Agent):
-    """自定义 Agent 模板（待学生实现）"""
+    """改进的智能台球Agent
+    
+    核心思想：
+    1. 智能目标选择：优先选择距离球袋较近的目标球
+    2. 几何分析：计算白球到目标球的最佳击球路径
+    3. 快速击球生成：基于几何关系生成初始击球参数
+    4. 局部优化：对初始击球进行小幅度调整
+    """
     
     def __init__(self):
-        pass
+        self.name = "SmartPoolAgent"
+        
+        # 球袋位置（标准台球桌的6个球袋）
+        self.pocket_positions = [
+            (0.0, 0.0),           # 左下角
+            (1.42, 0.0),          # 右下角  
+            (0.0, 2.84),          # 左上角
+            (1.42, 2.84),         # 右上角
+            (0.71, 1.42),         # 中间左侧
+            (0.71, 1.42),         # 中间右侧（相同点，实际只有4个角袋+2个中袋）
+        ]
+        
+    def _get_ball_position(self, ball_id, balls):
+        """获取球的位置坐标"""
+        if ball_id in balls and balls[ball_id].state.s != 4:  # 4表示进袋状态
+            pos = balls[ball_id].state.rvw[0]
+            return (float(pos[0]), float(pos[1]))
+        return None
+    
+    def _calculate_distance(self, pos1, pos2):
+        """计算两点间的欧氏距离"""
+        if pos1 is None or pos2 is None:
+            return float('inf')
+        return math.sqrt((pos1[0] - pos2[0])**2 + (pos1[1] - pos2[1])**2)
+    
+    def _find_best_target(self, balls, my_targets):
+        """智能选择最佳目标球"""
+        cue_pos = self._get_ball_position('cue', balls)
+        if cue_pos is None:
+            return None
+            
+        best_ball = None
+        best_score = float('-inf')
+        
+        for ball_id in my_targets:
+            ball_pos = self._get_ball_position(ball_id, balls)
+            if ball_pos is None:
+                continue
+                
+            # 计算到最近球袋的距离
+            min_pocket_dist = min(self._calculate_distance(ball_pos, pocket) 
+                                for pocket in self.pocket_positions)
+            
+            # 计算到白球的距离
+            cue_dist = self._calculate_distance(cue_pos, ball_pos)
+            
+            # 综合评分：距离球袋越近、距离白球越近越好
+            score = -min_pocket_dist - 0.5 * cue_dist
+            
+            if score > best_score:
+                best_score = score
+                best_ball = ball_id
+                
+        return best_ball
+    
+    def _calculate_shot_parameters(self, cue_pos, target_pos, table):
+        """计算击球参数"""
+        # 计算方向角度
+        dx = target_pos[0] - cue_pos[0]
+        dy = target_pos[1] - cue_pos[1]
+        phi = math.degrees(math.atan2(dy, dx))
+        
+        # 计算距离并确定初速度
+        distance = self._calculate_distance(cue_pos, target_pos)
+        V0 = min(max(1.0 + distance * 2, 0.5), 8.0)  # 距离越远速度越大
+        
+        # 简化参数：直接瞄准目标球
+        a = 0.0  # 横向偏移
+        b = 0.0  # 纵向偏移
+        theta = 30.0  # 固定垂直角度
+        
+        return {
+            'V0': round(V0, 2),
+            'phi': round(phi % 360, 2),
+            'theta': round(theta, 2),
+            'a': round(a, 3),
+            'b': round(b, 3)
+        }
+    
+    def _optimize_shot(self, action, balls, my_targets, table, max_iter=5):
+        """对初始击球进行局部优化"""
+        try:
+            # 保存原始状态
+            original_action = action.copy()
+            best_action = action.copy()
+            best_score = -float('inf')
+            
+            for _ in range(max_iter):
+                # 生成邻近动作
+                optimized_action = {
+                    'V0': max(0.5, min(8.0, best_action['V0'] + np.random.normal(0, 0.3))),
+                    'phi': (best_action['phi'] + np.random.normal(0, 10)) % 360,
+                    'theta': max(0, min(90, best_action['theta'] + np.random.normal(0, 5))),
+                    'a': max(-0.5, min(0.5, best_action['a'] + np.random.normal(0, 0.1))),
+                    'b': max(-0.5, min(0.5, best_action['b'] + np.random.normal(0, 0.1)))
+                }
+                
+                # 快速评估（不完整模拟）
+                score = self._quick_evaluate(optimized_action, balls, my_targets)
+                
+                if score > best_score:
+                    best_score = score
+                    best_action = optimized_action.copy()
+            
+            # 格式化返回
+            for key in best_action:
+                if key in ['V0', 'phi', 'theta']:
+                    best_action[key] = round(best_action[key], 2)
+                else:
+                    best_action[key] = round(best_action[key], 3)
+                    
+            return best_action
+            
+        except Exception as e:
+            # 优化失败，返回原始动作
+            return original_action
+    
+    def _quick_evaluate(self, action, balls, my_targets):
+        """快速评估击球质量（不进行完整物理模拟）"""
+        try:
+            cue_pos = self._get_ball_position('cue', balls)
+            if cue_pos is None:
+                return 0
+                
+            # 检查是否有明确的目标
+            if not my_targets:
+                return 0
+                
+            target_ball = my_targets[0] if isinstance(my_targets[0], str) else str(my_targets[0])
+            target_pos = self._get_ball_position(target_ball, balls)
+            
+            if target_pos is None:
+                return 10  # 目标球已进袋，给予奖励
+                
+            # 基于距离的简单评估
+            distance = self._calculate_distance(cue_pos, target_pos)
+            
+            # 距离越近得分越高
+            base_score = max(0, 100 - distance * 20)
+            
+            # 速度适中的奖励
+            if 2.0 <= action['V0'] <= 4.0:
+                base_score += 20
+                
+            # 角度合理的奖励
+            if 15 <= action['theta'] <= 45:
+                base_score += 10
+                
+            return base_score
+            
+        except Exception:
+            return 0
     
     def decision(self, balls=None, my_targets=None, table=None):
         """决策方法
         
         参数：
-            observation: (balls, my_targets, table)
+            balls: 球状态字典
+            my_targets: 目标球ID列表
+            table: 球桌对象
         
         返回：
             dict: {'V0', 'phi', 'theta', 'a', 'b'}
         """
-        return self._random_action()
+        try:
+            # 检查输入参数
+            if balls is None or my_targets is None:
+                print(f"[{self.name}] 缺少关键参数，使用随机动作")
+                return self._random_action()
+                
+            # 处理目标球（如果已清空，切换到黑8）
+            remaining_own = [bid for bid in my_targets if self._get_ball_position(bid, balls) is not None]
+            if len(remaining_own) == 0:
+                if '8' in my_targets or my_targets == ['8']:
+                    my_targets = ['8']
+                else:
+                    my_targets = remaining_own if remaining_own else my_targets
+                    
+            if not my_targets:
+                print(f"[{self.name}] 无有效目标球，使用随机动作")
+                return self._random_action()
+
+            # 智能选择最佳目标球
+            best_target = self._find_best_target(balls, my_targets)
+            if best_target is None:
+                print(f"[{self.name}] 无法选择目标球，使用随机动作")
+                return self._random_action()
+
+            # 获取位置信息
+            cue_pos = self._get_ball_position('cue', balls)
+            target_pos = self._get_ball_position(best_target, balls)
+            
+            if cue_pos is None or target_pos is None:
+                print(f"[{self.name}] 无法获取位置信息，使用随机动作")
+                return self._random_action()
+
+            # 计算基础击球参数
+            action = self._calculate_shot_parameters(cue_pos, target_pos, table)
+            
+            # 进行局部优化
+            optimized_action = self._optimize_shot(action, balls, my_targets, table)
+            
+            print(f"[{self.name}] 目标: {best_target}, 决策: "
+                  f"V0={optimized_action['V0']:.2f}, φ={optimized_action['phi']:.1f}°, "
+                  f"θ={optimized_action['theta']:.1f}°")
+            
+            return optimized_action
+            
+        except Exception as e:
+            print(f"[{self.name}] 决策时发生错误: {e}")
+            import traceback
+            traceback.print_exc()
+            return self._random_action()
