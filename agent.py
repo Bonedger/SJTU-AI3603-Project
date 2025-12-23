@@ -17,12 +17,16 @@ import os
 from datetime import datetime
 import random
 import signal
+import sys
+import concurrent.futures
 # from poolagent.pool import Pool as CuetipEnv, State as CuetipState
 # from poolagent import FunctionAgent
 
 from bayes_opt import BayesianOptimization, SequentialDomainReductionTransformer
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import Matern
+
+import json
 
 # ============ 超时安全模拟机制 ============
 class SimulationTimeoutError(Exception):
@@ -47,22 +51,62 @@ def simulate_with_timeout(shot, timeout=3):
         使用 signal.SIGALRM 实现超时机制（仅支持 Unix/Linux）
         超时后自动恢复，不会导致程序卡死
     """
-    # 设置超时信号处理器
-    old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
-    signal.alarm(timeout)  # 设置超时时间
+    # 以下注释内容为原版代码，可在Linux上运行，Windows上需要修改为使用线程池实现
+    # 最终提交时需要修改为原版代码class RLAgent(Agent):
+    def __init__(self):
+        # ...
+        self.pop_size = 24       # 每次思考产生的随机方案数量（越大越准，越慢）
+        self.n_iters = 2         # 反复优化的轮数（越大越准，越慢）
+        self.elite_frac = 0.25   # 筛选比例
+    # # 设置超时信号处理器
+    # old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+    # signal.alarm(timeout)  # 设置超时时间
     
-    try:
-        pt.simulate(shot, inplace=True)
-        signal.alarm(0)  # 取消超时
-        return True
-    except SimulationTimeoutError:
-        print(f"[WARNING] 物理模拟超时（>{timeout}秒），跳过此次模拟")
-        return False
-    except Exception as e:
-        signal.alarm(0)  # 取消超时
-        raise e
-    finally:
-        signal.signal(signal.SIGALRM, old_handler)  # 恢复原处理器
+    # try:
+    #     pt.simulate(shot, inplace=True)
+    #     signal.alarm(0)  # 取消超时
+    #     return True
+    # except SimulationTimeoutError:
+    #     print(f"[WARNING] 物理模拟超时（>{timeout}秒），跳过此次模拟")
+    #     return False
+    # except Exception as e:
+    #     signal.alarm(0)  # 取消超时
+    #     raise e
+    # finally:
+    #     signal.signal(signal.SIGALRM, old_handler)  # 恢复原处理器
+
+    if hasattr(signal, 'SIGALRM'):
+        # Unix/Linux: 使用 signal 实现 (支持真正的中断)
+        try:
+            old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+            signal.alarm(timeout)
+            pt.simulate(shot, inplace=True)
+            signal.alarm(0)
+            return True
+        except SimulationTimeoutError:
+            print(f"[WARNING] 物理模拟超时（>{timeout}秒）")
+            return False
+        except Exception as e:
+            signal.alarm(0)
+            raise e
+        finally:
+            signal.signal(signal.SIGALRM, old_handler)
+    else:
+        # Windows: 使用线程池实现 (无法真正杀死线程，但能防止主进程卡死)
+        def _task():
+            pt.simulate(shot, inplace=True)
+            return True
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_task)
+            try:
+                return future.result(timeout=timeout)
+            except concurrent.futures.TimeoutError:
+                print(f"[WARNING] 物理模拟超时（>{timeout}秒 - Windows后台线程）")
+                return False
+            except Exception as e:
+                # 捕获其他异常
+                raise e
 
 # ============================================
 
@@ -600,6 +644,724 @@ class NewAgent(Agent):
             
         except Exception as e:
             print(f"[{self.name}] 决策时发生错误: {e}")
+            import traceback
+            traceback.print_exc()
+            return self._random_action()
+
+
+class RLAgent(Agent):
+    def __init__(self):
+        super().__init__()
+        self.name = "RLCEMAgent"
+        self.pbounds = {
+            'V0': (0.5, 8.0),
+            'phi': (0, 360),
+            'theta': (0, 90),
+            'a': (-0.5, 0.5),
+            'b': (-0.5, 0.5),
+        }
+        self.pop_size = 24
+        self.n_iters = 3
+        self.elite_frac = 0.25
+        self.sim_timeout = 2
+        self.min_std = {
+            'V0': 0.2,
+            'phi': 3.0,
+            'theta': 2.0,
+            'a': 0.03,
+            'b': 0.03,
+        }
+
+    def _get_ball_position(self, ball_id, balls):
+        if ball_id in balls and balls[ball_id].state.s != 4:
+            pos = balls[ball_id].state.rvw[0]
+            return (float(pos[0]), float(pos[1]))
+        return None
+
+    def _dist(self, p1, p2):
+        if p1 is None or p2 is None:
+            return float('inf')
+        dx = p1[0] - p2[0]
+        dy = p1[1] - p2[1]
+        return math.sqrt(dx * dx + dy * dy)
+
+    def _table_pockets_xy(self, table):
+        if table is None or not hasattr(table, 'pockets'):
+            return [(0.0, 0.0), (1.42, 0.0), (0.0, 2.84), (1.42, 2.84), (0.71, 0.0), (0.71, 2.84)]
+        pockets = []
+        for p in table.pockets.values():
+            c = p.center
+            pockets.append((float(c[0]), float(c[1])))
+        return pockets
+
+    def _choose_target(self, balls, my_targets, table):
+        cue_pos = self._get_ball_position('cue', balls)
+        if cue_pos is None:
+            return None
+        pockets = self._table_pockets_xy(table)
+
+        best_bid = None
+        best_score = float('-inf')
+        for bid in my_targets:
+            bpos = self._get_ball_position(bid, balls)
+            if bpos is None:
+                continue
+            d_cue = self._dist(cue_pos, bpos)
+            d_pocket = min(self._dist(bpos, pk) for pk in pockets)
+            score = -0.6 * d_cue - 1.0 * d_pocket
+            if score > best_score:
+                best_score = score
+                best_bid = bid
+        return best_bid
+
+    def _heuristic_action(self, balls, my_targets, table):
+        target = self._choose_target(balls, my_targets, table)
+        cue_pos = self._get_ball_position('cue', balls)
+        target_pos = self._get_ball_position(target, balls) if target is not None else None
+        if cue_pos is None or target_pos is None:
+            return self._random_action()
+
+        dx = target_pos[0] - cue_pos[0]
+        dy = target_pos[1] - cue_pos[1]
+        phi = (math.degrees(math.atan2(dy, dx)) + 360.0) % 360.0
+        distance = self._dist(cue_pos, target_pos)
+        V0 = float(np.clip(1.2 + 2.2 * distance, 0.5, 8.0))
+        return {
+            'V0': V0,
+            'phi': phi,
+            'theta': 25.0,
+            'a': 0.0,
+            'b': 0.0,
+        }
+
+    def _clip_action(self, action):
+        clipped = dict(action)
+        clipped['V0'] = float(np.clip(clipped['V0'], *self.pbounds['V0']))
+        clipped['phi'] = float(clipped['phi'] % 360)
+        clipped['theta'] = float(np.clip(clipped['theta'], *self.pbounds['theta']))
+        clipped['a'] = float(np.clip(clipped['a'], *self.pbounds['a']))
+        clipped['b'] = float(np.clip(clipped['b'], *self.pbounds['b']))
+        return clipped
+
+    def _evaluate_action(self, action, balls, table, last_state_snapshot, my_targets):
+        sim_balls = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
+        sim_table = copy.deepcopy(table)
+        cue = pt.Cue(cue_ball_id="cue")
+        shot = pt.System(table=sim_table, balls=sim_balls, cue=cue)
+        shot.cue.set_state(
+            V0=action['V0'],
+            phi=action['phi'],
+            theta=action['theta'],
+            a=action['a'],
+            b=action['b'],
+        )
+        if not simulate_with_timeout(shot, timeout=self.sim_timeout):
+            return 0.0
+        return float(analyze_shot_for_reward(shot=shot, last_state=last_state_snapshot, player_targets=my_targets))
+
+    def decision(self, balls=None, my_targets=None, table=None):
+        if balls is None or my_targets is None or table is None:
+            return self._random_action()
+
+        try:
+            last_state_snapshot = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
+
+            remaining_own = [bid for bid in my_targets if bid in balls and balls[bid].state.s != 4]
+            if len(remaining_own) == 0:
+                my_targets = ['8']
+
+            base_action = self._heuristic_action(balls, my_targets, table)
+            mean = self._clip_action(base_action)
+            std = {
+                'V0': 1.0,
+                'phi': 18.0,
+                'theta': 10.0,
+                'a': 0.12,
+                'b': 0.12,
+            }
+
+            best_action = mean
+            best_score = float('-inf')
+
+            elite_k = max(1, int(self.pop_size * self.elite_frac))
+
+            for _ in range(self.n_iters):
+                actions = []
+                scores = []
+
+                for _ in range(self.pop_size):
+                    sampled = {
+                        'V0': mean['V0'] + float(np.random.normal(0, std['V0'])),
+                        'phi': mean['phi'] + float(np.random.normal(0, std['phi'])),
+                        'theta': mean['theta'] + float(np.random.normal(0, std['theta'])),
+                        'a': mean['a'] + float(np.random.normal(0, std['a'])),
+                        'b': mean['b'] + float(np.random.normal(0, std['b'])),
+                    }
+                    sampled = self._clip_action(sampled)
+                    score = self._evaluate_action(sampled, balls, table, last_state_snapshot, my_targets)
+                    actions.append(sampled)
+                    scores.append(score)
+
+                    if score > best_score:
+                        best_score = score
+                        best_action = sampled
+
+                elite_idx = np.argsort(scores)[-elite_k:]
+                elite_actions = [actions[i] for i in elite_idx]
+
+                mean = {
+                    k: float(np.mean([a[k] for a in elite_actions]))
+                    for k in ['V0', 'phi', 'theta', 'a', 'b']
+                }
+                mean = self._clip_action(mean)
+
+                for k in std.keys():
+                    v = float(np.std([a[k] for a in elite_actions]))
+                    std[k] = max(v, self.min_std[k])
+
+            action = {
+                'V0': round(float(best_action['V0']), 2),
+                'phi': round(float(best_action['phi']), 2),
+                'theta': round(float(best_action['theta']), 2),
+                'a': round(float(best_action['a']), 3),
+                'b': round(float(best_action['b']), 3),
+            }
+            print(f"[{self.name}] 决策(估计得分: {best_score:.2f}): V0={action['V0']:.2f}, phi={action['phi']:.2f}, theta={action['theta']:.2f}, a={action['a']:.3f}, b={action['b']:.3f}")
+            return action
+        except Exception as e:
+            print(f"[{self.name}] 决策异常: {e}")
+            import traceback
+            traceback.print_exc()
+            return self._random_action()
+
+
+class SearchAgent(RLAgent):
+    def __init__(self):
+        super().__init__()
+        self.name = "SearchAgent"
+        self.beam_width = 6
+        self.max_evals = 72
+        self.sim_timeout = 2
+
+    def decision(self, balls=None, my_targets=None, table=None):
+        if balls is None or my_targets is None or table is None:
+            return self._random_action()
+
+        try:
+            last_state_snapshot = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
+
+            remaining_own = [bid for bid in my_targets if bid in balls and balls[bid].state.s != 4]
+            if len(remaining_own) == 0:
+                my_targets = ['8']
+
+            base_action = self._clip_action(self._heuristic_action(balls, my_targets, table))
+
+            score_cache = {}
+
+            def _key(a):
+                return (
+                    round(float(a['V0']), 2),
+                    round(float(a['phi']) % 360.0, 2),
+                    round(float(a['theta']), 2),
+                    round(float(a['a']), 3),
+                    round(float(a['b']), 3),
+                )
+
+            def _eval(a):
+                k = _key(a)
+                if k in score_cache:
+                    return score_cache[k]
+                s = self._evaluate_action(a, balls, table, last_state_snapshot, my_targets)
+                score_cache[k] = float(s)
+                return float(s)
+
+            total_evals = 0
+            base_score = _eval(base_action)
+            total_evals += 1
+
+            best_action = base_action
+            best_score = base_score
+
+            beam = [(base_action, base_score)]
+
+            schedule = [
+                ('phi', [0.0, 18.0, -18.0, 9.0, -9.0]),
+                ('V0', [0.0, 1.0, -1.0, 0.45, -0.45]),
+                ('theta', [0.0, 10.0, -10.0, 5.0, -5.0]),
+                ('phi', [0.0, 5.0, -5.0, 2.0, -2.0]),
+                ('a', [0.0, 0.12, -0.12, 0.06, -0.06]),
+                ('b', [0.0, 0.12, -0.12, 0.06, -0.06]),
+            ]
+
+            for param, deltas in schedule:
+                if total_evals >= self.max_evals:
+                    break
+                candidates = []
+
+                for a, _ in beam:
+                    if total_evals >= self.max_evals:
+                        break
+                    for d in deltas:
+                        if total_evals >= self.max_evals:
+                            break
+
+                        na = dict(a)
+                        na[param] = float(na[param]) + float(d)
+                        na = self._clip_action(na)
+                        s = _eval(na)
+                        total_evals += 1
+                        candidates.append((na, s))
+
+                        if s > best_score:
+                            best_score = s
+                            best_action = na
+
+                if len(candidates) == 0:
+                    break
+                candidates.sort(key=lambda x: x[1])
+                beam = candidates[-self.beam_width:]
+
+            action = {
+                'V0': round(float(best_action['V0']), 2),
+                'phi': round(float(best_action['phi']), 2),
+                'theta': round(float(best_action['theta']), 2),
+                'a': round(float(best_action['a']), 3),
+                'b': round(float(best_action['b']), 3),
+            }
+            print(
+                f"[{self.name}] 决策(搜索评估: {best_score:.2f}, evals={total_evals}): "
+                f"V0={action['V0']:.2f}, phi={action['phi']:.2f}, theta={action['theta']:.2f}, "
+                f"a={action['a']:.3f}, b={action['b']:.3f}"
+            )
+            return action
+        except Exception as e:
+            print(f"[{self.name}] 决策异常: {e}")
+            import traceback
+            traceback.print_exc()
+            return self._random_action()
+
+
+class CEMAgent(Agent):
+    def __init__(self, params=None, checkpoint_path=None):
+        super().__init__()
+        self.name = "CEMHeuristicAgent"
+        self.ball_diameter = 0.05715
+        self.param_bounds = {
+            'w_cue': (0.0, 3.0),
+            'w_pocket': (0.0, 4.0),
+            'w_block': (0.0, 6.0),
+            'w_align': (0.0, 6.0),
+            'v0_offset': (0.5, 3.0),
+            'v0_scale': (0.5, 6.0),
+            'v0_align_scale': (0.0, 3.0),
+            'theta': (5.0, 45.0),
+            'ghost_factor': (0.7, 1.3),
+        }
+
+        self.params = self._default_params()
+        if params is not None:
+            self.params.update(params)
+        if checkpoint_path is not None:
+            loaded = self._load_checkpoint(checkpoint_path)
+            if loaded is not None:
+                self.params.update(loaded)
+        self.params = self._clip_params(self.params)
+
+    def _default_params(self):
+        return {
+            'w_cue': 0.8,
+            'w_pocket': 1.6,
+            'w_block': 2.0,
+            'w_align': 1.5,
+            'v0_offset': 1.2,
+            'v0_scale': 2.2,
+            'v0_align_scale': 0.6,
+            'theta': 20.0,
+            'ghost_factor': 1.0,
+        }
+
+    def _clip_params(self, params):
+        clipped = dict(params)
+        for k, (lo, hi) in self.param_bounds.items():
+            if k not in clipped:
+                continue
+            clipped[k] = float(np.clip(float(clipped[k]), lo, hi))
+        return clipped
+
+    def _load_checkpoint(self, checkpoint_path):
+        try:
+            with open(checkpoint_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            if isinstance(data, dict) and 'params' in data and isinstance(data['params'], dict):
+                return data['params']
+            if isinstance(data, dict):
+                return data
+            return None
+        except Exception:
+            return None
+
+    def _get_ball_xy(self, ball_id, balls):
+        if ball_id in balls and balls[ball_id].state.s != 4:
+            pos = balls[ball_id].state.rvw[0]
+            return (float(pos[0]), float(pos[1]))
+        return None
+
+    def _dist(self, p1, p2):
+        if p1 is None or p2 is None:
+            return float('inf')
+        dx = p1[0] - p2[0]
+        dy = p1[1] - p2[1]
+        return math.sqrt(dx * dx + dy * dy)
+
+    def _unit_vec(self, src, dst):
+        dx = dst[0] - src[0]
+        dy = dst[1] - src[1]
+        n = math.sqrt(dx * dx + dy * dy)
+        if n < 1e-9:
+            return (0.0, 0.0)
+        return (dx / n, dy / n)
+
+    def _dot(self, u, v):
+        return u[0] * v[0] + u[1] * v[1]
+
+    def _segment_distance(self, p, a, b):
+        ax, ay = a
+        bx, by = b
+        px, py = p
+        abx = bx - ax
+        aby = by - ay
+        apx = px - ax
+        apy = py - ay
+        ab2 = abx * abx + aby * aby
+        if ab2 < 1e-12:
+            return math.sqrt((px - ax) ** 2 + (py - ay) ** 2)
+        t = (apx * abx + apy * aby) / ab2
+        t = max(0.0, min(1.0, t))
+        cx = ax + t * abx
+        cy = ay + t * aby
+        dx = px - cx
+        dy = py - cy
+        return math.sqrt(dx * dx + dy * dy)
+
+    def _pockets_xy(self, table):
+        if table is None or not hasattr(table, 'pockets'):
+            return [(0.0, 0.0), (1.42, 0.0), (0.0, 2.84), (1.42, 2.84), (0.71, 0.0), (0.71, 2.84)]
+        pockets = []
+        for p in table.pockets.values():
+            c = p.center
+            pockets.append((float(c[0]), float(c[1])))
+        return pockets
+
+    def _choose_shot(self, balls, my_targets, table):
+        cue_xy = self._get_ball_xy('cue', balls)
+        if cue_xy is None:
+            return None
+
+        pockets = self._pockets_xy(table)
+        ball_radius = 0.5 * self.ball_diameter
+        ghost_offset = self.params['ghost_factor'] * (2.0 * ball_radius)
+
+        best = None
+        best_score = float('-inf')
+
+        alive_ball_ids = [bid for bid, b in balls.items() if b.state.s != 4 and bid not in ['cue']]
+        blockers = [bid for bid in alive_ball_ids if bid not in my_targets]
+
+        for target_id in my_targets:
+            target_xy = self._get_ball_xy(target_id, balls)
+            if target_xy is None:
+                continue
+            for pocket_xy in pockets:
+                u_tp = self._unit_vec(target_xy, pocket_xy)
+                ghost_xy = (target_xy[0] - u_tp[0] * ghost_offset, target_xy[1] - u_tp[1] * ghost_offset)
+
+                d_cue = self._dist(cue_xy, ghost_xy)
+                d_pocket = self._dist(target_xy, pocket_xy)
+
+                u_cg = self._unit_vec(cue_xy, ghost_xy)
+                align = max(-1.0, min(1.0, self._dot(u_cg, u_tp)))
+                align_penalty = 1.0 - align
+
+                blocked_count = 0
+                for bid in blockers:
+                    bxy = self._get_ball_xy(bid, balls)
+                    if bxy is None:
+                        continue
+                    if self._segment_distance(bxy, cue_xy, ghost_xy) < (2.2 * ball_radius):
+                        blocked_count += 1
+
+                score = (
+                    -self.params['w_cue'] * d_cue
+                    -self.params['w_pocket'] * d_pocket
+                    -self.params['w_block'] * blocked_count
+                    -self.params['w_align'] * align_penalty
+                )
+
+                if score > best_score:
+                    best_score = score
+                    best = {
+                        'target_id': target_id,
+                        'pocket_xy': pocket_xy,
+                        'ghost_xy': ghost_xy,
+                        'd_cue': d_cue,
+                        'align_penalty': align_penalty,
+                    }
+        return best
+
+    def decision(self, balls=None, my_targets=None, table=None):
+        if balls is None or my_targets is None or table is None:
+            return self._random_action()
+
+        remaining_own = [bid for bid in my_targets if bid in balls and balls[bid].state.s != 4]
+        if len(remaining_own) == 0:
+            my_targets = ['8']
+
+        shot = self._choose_shot(balls, my_targets, table)
+        if shot is None:
+            return self._random_action()
+
+        cue_xy = self._get_ball_xy('cue', balls)
+        ghost_xy = shot['ghost_xy']
+        dx = ghost_xy[0] - cue_xy[0]
+        dy = ghost_xy[1] - cue_xy[1]
+        phi = (math.degrees(math.atan2(dy, dx)) + 360.0) % 360.0
+
+        V0 = (
+            self.params['v0_offset']
+            + self.params['v0_scale'] * float(shot['d_cue'])
+            + self.params['v0_align_scale'] * float(shot['align_penalty'])
+        )
+        V0 = float(np.clip(V0, 0.5, 8.0))
+        theta = float(np.clip(self.params['theta'], 0.0, 90.0))
+
+        action = {
+            'V0': round(V0, 2),
+            'phi': round(float(phi), 2),
+            'theta': round(theta, 2),
+            'a': 0.0,
+            'b': 0.0,
+        }
+        print(f"[{self.name}] 决策: V0={action['V0']:.2f}, phi={action['phi']:.2f}, theta={action['theta']:.2f}")
+        return action
+
+
+class MCTSNode:
+    """蒙特卡洛树搜索节点"""
+    def __init__(self, balls, parent=None, action_from_parent=None):
+        self.balls = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
+        self.parent = parent
+        self.action_from_parent = action_from_parent
+        self.children = []
+        self.visits = 0
+        self.value = 0.0
+        self.untried_actions = []
+        self.reward_from_parent = 0.0
+
+    def expand(self, action, next_balls, reward):
+        child = MCTSNode(next_balls, parent=self, action_from_parent=action)
+        child.reward_from_parent = reward
+        self.children.append(child)
+        return child
+
+
+class MCTSAgent(RLAgent):
+    """基于蒙特卡洛树搜索 (MCTS) 的 Agent"""
+    def __init__(self):
+        super().__init__()
+        self.name = "MCTSAgent"
+        self.n_sims = 20        # 每次决策的模拟次数（受限于物理引擎速度，设为较小值）
+        self.c_puct = 1.414     # 探索常数
+        self.sim_timeout = 2    # 模拟超时时间
+        self.max_depth = 3      # 最大搜索深度
+        self.action_samples = 8 # 每个节点采样的动作数量
+
+    def _get_untried_actions(self, balls, my_targets, table):
+        """生成候选动作列表"""
+        actions = []
+        
+        # 1. 启发式基础动作
+        base_action = self._heuristic_action(balls, my_targets, table)
+        base_action = self._clip_action(base_action)
+        actions.append(base_action)
+
+        # 2. 在基础动作周围进行微扰
+        variations = [
+            {'phi': 1.5}, {'phi': -1.5},
+            {'phi': 5.0}, {'phi': -5.0},
+            {'V0': 0.8}, {'V0': -0.8},
+            {'theta': 5.0}, {'theta': -5.0},
+            {'a': 0.05}, {'a': -0.05},
+            {'b': 0.05}, {'b': -0.05}
+        ]
+        
+        for var in variations:
+            new_a = dict(base_action)
+            for k, v in var.items():
+                new_a[k] += v
+            new_a = self._clip_action(new_a)
+            actions.append(new_a)
+        
+        # 3. 随机动作补充（增加探索性）
+        for _ in range(2):
+            actions.append(self._random_action())
+
+        # 截断或采样到指定数量
+        if len(actions) > self.action_samples:
+            actions = actions[:self.action_samples]
+            
+        return actions
+
+    def _simulate_transition(self, balls, action, table, my_targets):
+        """执行动作并返回 (next_balls, reward)"""
+        sim_balls = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
+        sim_table = copy.deepcopy(table)
+        cue = pt.Cue(cue_ball_id="cue")
+        shot = pt.System(table=sim_table, balls=sim_balls, cue=cue)
+        shot.cue.set_state(**action)
+        
+        success = simulate_with_timeout(shot, timeout=self.sim_timeout)
+        if not success:
+            return None, -100.0
+            
+        reward = analyze_shot_for_reward(shot, balls, my_targets)
+        return shot.balls, reward
+
+    def _rollout(self, node, my_targets, table):
+        """执行快速 Rollout 模拟
+        
+        策略：
+        1. 使用简单的启发式策略模拟后续 1-2 步
+        2. 返回累积奖励
+        """
+        current_balls = node.balls
+        total_reward = node.reward_from_parent
+        depth = 0
+        max_rollout_depth = 1  # 仅多看一步，权衡性能
+        gamma = 0.8  # 折扣因子
+
+        # 为了避免无限循环或状态问题，这里做一个简单的拷贝
+        temp_targets = list(my_targets)
+
+        while depth < max_rollout_depth:
+            # 简单检查游戏是否结束
+            # 检查目标球是否都在台面上
+            remaining = [bid for bid in temp_targets if bid in current_balls and current_balls[bid].state.s != 4]
+            
+            # 如果目标球清空了，切换到8号球
+            if not remaining and '8' not in temp_targets:
+                 temp_targets = ['8']
+                 remaining = ['8']
+
+            if not remaining: # 赢了
+                total_reward += 100
+                break
+            
+            # 使用启发式动作快速决策
+            try:
+                action = self._heuristic_action(current_balls, temp_targets, table)
+                action = self._clip_action(action)
+                
+                # 模拟
+                next_balls, reward = self._simulate_transition(current_balls, action, table, temp_targets)
+                if next_balls is None:
+                    break
+                    
+                total_reward += gamma * reward
+                current_balls = next_balls
+                depth += 1
+            except Exception:
+                break
+            
+        return total_reward
+
+    def decision(self, balls=None, my_targets=None, table=None):
+        if balls is None or my_targets is None or table is None:
+            return self._random_action()
+
+        try:
+            # 初始化根节点
+            root = MCTSNode(balls)
+            root.untried_actions = self._get_untried_actions(balls, my_targets, table)
+            
+            # 处理目标球
+            remaining_own = [bid for bid in my_targets if bid in balls and balls[bid].state.s != 4]
+            if len(remaining_own) == 0:
+                my_targets = ['8']
+
+            print(f"[{self.name}] 开始搜索 (Sims={self.n_sims})...")
+
+            for i in range(self.n_sims):
+                node = root
+                depth = 0
+                
+                # 1. Selection (选择)
+                # 当节点已完全扩展且有子节点时，继续向下选择
+                while not node.untried_actions and node.children:
+                    # UCB 公式选择最佳子节点
+                    # Value = exploitation + exploration
+                    best_score = float('-inf')
+                    best_child = None
+                    
+                    for child in node.children:
+                        exploitation = child.value / (child.visits + 1e-6)
+                        exploration = self.c_puct * math.sqrt(math.log(node.visits + 1) / (child.visits + 1e-6))
+                        score = exploitation + exploration
+                        
+                        if score > best_score:
+                            best_score = score
+                            best_child = child
+                    
+                    if best_child:
+                        node = best_child
+                        depth += 1
+                    else:
+                        break
+
+                # 2. Expansion (扩展)
+                # 如果节点还有未尝试的动作，且未达到最大深度，则扩展一个动作
+                if node.untried_actions and depth < self.max_depth:
+                    action = node.untried_actions.pop(0)
+                    next_balls, reward = self._simulate_transition(node.balls, action, table, my_targets)
+                    
+                    if next_balls:
+                        # 创建子节点
+                        node = node.expand(action, next_balls, reward)
+                        depth += 1
+                
+                # 3. Simulation (模拟/评估)
+                # 使用 Rollout 进行评估，而不是仅仅看单步 reward
+                eval_score = self._rollout(node, my_targets, table)
+                
+                # 4. Backpropagation (回溯)
+                while node:
+                    node.visits += 1
+                    node.value += eval_score
+                    # 可以引入折扣因子 gamma，但在单局台球中，直接累加也合理
+                    node = node.parent
+
+            # 决策：选择访问次数最多的子节点
+            if not root.children:
+                print(f"[{self.name}] 搜索未生成有效子节点，使用启发式动作。")
+                return self._clip_action(self._heuristic_action(balls, my_targets, table))
+            
+            best_child = max(root.children, key=lambda c: c.visits)
+            action = best_child.action_from_parent
+            
+            # 格式化输出
+            action = {
+                'V0': round(float(action['V0']), 2),
+                'phi': round(float(action['phi']), 2),
+                'theta': round(float(action['theta']), 2),
+                'a': round(float(action['a']), 3),
+                'b': round(float(action['b']), 3),
+            }
+            
+            print(f"[{self.name}] 决策 (Visits={best_child.visits}/{self.n_sims}, Val={best_child.value/best_child.visits:.1f}): "
+                  f"V0={action['V0']}, phi={action['phi']}, theta={action['theta']}")
+            return action
+
+        except Exception as e:
+            print(f"[{self.name}] 决策异常: {e}")
             import traceback
             traceback.print_exc()
             return self._random_action()

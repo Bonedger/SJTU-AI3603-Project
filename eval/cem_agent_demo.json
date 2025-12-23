@@ -1,0 +1,68 @@
+{
+  "params": {
+    "w_cue": 1.747303702006579,
+    "w_pocket": 2.6420096655987653,
+    "w_block": 2.425317676543187,
+    "w_align": 2.521222040074843,
+    "v0_offset": 1.8449046367729731,
+    "v0_scale": 2.8922667384854908,
+    "v0_align_scale": 0.5026460714018564,
+    "theta": 15.128854562444566,
+    "ghost_factor": 1.1773325037239823
+  },
+  "fitness": 0.5,
+  "iter": 2,
+  "keys": [
+    "w_cue",
+    "w_pocket",
+    "w_block",
+    "w_align",
+    "v0_offset",
+    "v0_scale",
+    "v0_align_scale",
+    "theta",
+    "ghost_factor"
+  ],
+  "bounds": {
+    "w_cue": [
+      0.0,
+      3.0
+    ],
+    "w_pocket": [
+      0.0,
+      4.0
+    ],
+    "w_block": [
+      0.0,
+      6.0
+    ],
+    "w_align": [
+      0.0,
+      6.0
+    ],
+    "v0_offset": [
+      0.5,
+      3.0
+    ],
+    "v0_scale": [
+      0.5,
+      6.0
+    ],
+    "v0_align_scale": [
+      0.0,
+      3.0
+    ],
+    "theta": [
+      5.0,
+      45.0
+    ],
+    "ghost_factor": [
+      0.7,
+      1.3
+    ]
+  },
+  "eval_games": 4,
+  "eval_repeats": 1,
+  "opponent": "random",
+  "seed": 123
+}
