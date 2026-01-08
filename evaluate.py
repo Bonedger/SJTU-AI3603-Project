@@ -12,10 +12,11 @@ evaluate.py - Agent 评估脚本
 3. 运行脚本查看结果
 """
 
-# 导入必要的模块
+import os
+
 from utils import set_random_seed
 from poolenv import PoolEnv
-from agent import BasicAgent, NewAgent, CEMAgent, SearchAgent, MCTSAgent, RLAgent
+from agents import BasicAgent, BasicAgentPro, NewAgent, CEMAgent, MCTSAgent, SearchAgent
 
 # 设置随机种子，enable=True 时使用固定种子，enable=False 时使用完全随机
 # 根据需求，我们在这里统一设置随机种子，确保 agent 双方的全局击球扰动使用相同的随机状态
@@ -23,13 +24,14 @@ set_random_seed(enable=False, seed=42)
 
 env = PoolEnv()
 results = {'AGENT_A_WIN': 0, 'AGENT_B_WIN': 0, 'SAME': 0}
-n_games = 64  # 对战局数 自己测试时可以修改 扩充为120局为了减少随机带来的扰动
+n_games = 120  # 对战局数 自己测试时可以修改 扩充为120局为了减少随机带来的扰动
 
-# agent_a, agent_b = BasicAgent(), NewAgent()
-# agent_a, agent_b = BasicAgent(), CEMAgent(checkpoint_path="eval/cem_agent_3.json")
-# agent_a, agent_b = BasicAgent(), SearchAgent()
+## 选择对打的对手
+# checkpoint_path = os.path.join("eval", "cem_agent_4.json")
+# agent_a, agent_b = BasicAgent(), CEMAgent(checkpoint_path=checkpoint_path)  # 与 BasicAgent 对打
 # agent_a, agent_b = BasicAgent(), MCTSAgent()
-agent_a, agent_b = BasicAgent(), RLAgent()
+agent_a, agent_b = BasicAgent(), SearchAgent()
+# agent_a, agent_b = BasicAgentPro(), NewAgent() # 与 BasicAgentPro 对打
 
 players = [agent_a, agent_b]  # 用于切换先后手
 target_ball_choice = ['solid', 'solid', 'stripe', 'stripe']  # 轮换球型

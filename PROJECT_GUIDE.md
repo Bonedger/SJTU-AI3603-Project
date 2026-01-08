@@ -21,9 +21,12 @@
 - 新方法的效果：运行evaluate.py文件后，项目提出的新智能体获得的分数。
 - 项目中的分工与每个人的贡献。
 
-报告请使用英文撰写，限制15页以内，陈述清楚即可，不需要在意报告页数。最终根据代码完成度、报告内容、击球效果进行综合评分。
+**有关BasicAgentPro的说明**：当对BasicAgent的胜率超过88%时，考虑到边际收益递减，为了能为大家提供更大的算法改进空间，展现算法的优越性，我们提供了BasicAgentPro供大家对打测试。当你的agent对BasicAgent的胜率超过88%时，推荐附上与Pro的对打分数。
 
-报告模板请参照IEEE会议双栏模板：https://www.overleaf.com/1998687845fyyfzhmpnfkd#b117f2
+**报告格式说明**：报告以**个人**为单位进行撰写，即小组内每人均需提交报告，展示对项目的思路和贡献。
+报告请使用英文撰写，限制15页以内，陈述清楚即可，不需要在意报告页数，也不推荐大家卷报告页数。最终根据代码完成度、报告内容、击球效果进行综合评分。
+
+**报告模板**：报告模板请参照IEEE会议双栏模板：https://www.overleaf.com/1998687845fyyfzhmpnfkd#b117f2
 此为共享链接，各组同学通过**overleaf**打开后左上角点击**Menu**，选择**Copy project**后在自己的模板上编辑
 
 # 环境配置
@@ -38,10 +41,7 @@ conda activate poolenv
 git clone https://github.com/SJTU-RL2/pooltool.git
 cd pooltool
 # 安装poetry
-# [修改] 降级为 1.8.4，解决 poetry 2.x 与旧版 poetry-core 不兼容导致的 ImportError
-pip install "poetry==1.8.4"
-# [新增] 预先安装 panda3d，解决 poetry install 下载大文件卡死的问题
-pip install panda3d==1.11.0.dev3702 --index-url https://archive.panda3d.org/simple/
+pip install "poetry==2.2.1"
 # 基于源代码安装poolenv
 poetry install --with=dev,docs
 # 运行base agent需要安装的库
