@@ -29,9 +29,10 @@ n_games = 120  # 对战局数 自己测试时可以修改 扩充为120局为了�
 ## 选择对打的对手
 # checkpoint_path = os.path.join("eval", "cem_agent_4.json")
 # agent_a, agent_b = BasicAgent(), CEMAgent(checkpoint_path=checkpoint_path)  # 与 BasicAgent 对打
-# agent_a, agent_b = BasicAgent(), MCTSAgent()
-agent_a, agent_b = BasicAgent(), SearchAgent()
-# agent_a, agent_b = BasicAgentPro(), NewAgent() # 与 BasicAgentPro 对打
+agent_a, agent_b = BasicAgent(), MCTSAgent()
+# agent_a, agent_b = BasicAgent(), SearchAgent()
+# agent_a, agent_b = BasicAgent(), NewAgent()
+# agent_a, agent_b = BasicAgentPro(), MCTSAgent() # 与 BasicAgentPro 对打
 
 players = [agent_a, agent_b]  # 用于切换先后手
 target_ball_choice = ['solid', 'solid', 'stripe', 'stripe']  # 轮换球型
